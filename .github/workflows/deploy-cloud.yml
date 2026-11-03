@@ -1,0 +1,78 @@
+# ============================================================
+#  推送到 main 分支 → 自动部署到腾讯云服务器
+#
+#  需要在仓库 Settings → Secrets and variables → Actions 里配置：
+#    DEPLOY_SSH_KEY   部署私钥全文（-----BEGIN ... END-----）
+#    SERVER_HOST      服务器公网 IP
+#    DEPLOY_USER      登录用户（默认 deploy）
+#    APP_DIR          服务器项目目录（默认 /opt/fullstack-cluster-tutorial）
+#
+#  说明：
+#  * 服务器上必须已经存在 deploy/cloud/.env，CI 不会覆盖它（打包时排除）
+#  * 首次部署请先手动跑一次 deploy.sh，确认 .env 填对了
+#  * 不想用 GitHub Actions，可换成腾讯云 CODING DevOps，流程完全一致
+# ============================================================
+
+name: Deploy to Tencent Cloud
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一时间只允许一个部署任务，避免两个版本交叉启动容器
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Package
+        run: |
+          tar --exclude='./.git' --exclude='./.git/*' \
+              --exclude='*/node_modules' --exclude='*/node_modules/*' \
+              --exclude='*/dist' --exclude='*/dist/*' \
+              --exclude='*/__pycache__' --exclude='*/__pycache__/*' \
+              --exclude='./deploy/cloud/.env' \
+              --exclude='./deploy/cloud/runtime' --exclude='./deploy/cloud/runtime/*' \
+              --exclude='./deploy/cloud/certs' --exclude='./deploy/cloud/certs/*' \
+              --exclude='./backups' --exclude='./backups/*' \
+              -czf /tmp/app.tgz .
+          ls -lh /tmp/app.tgz
+
+      - name: Upload
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          scp -i ~/.ssh/id_ed25519 /tmp/app.tgz "${USER}@${HOST}:/tmp/fullstack-deploy.tgz"
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${USER}@${HOST}" "APP_DIR='${APP_DIR}' bash -s" <<'REMOTE'
+          set -e
+          APP_DIR="${APP_DIR:-/opt/fullstack-cluster-tutorial}"
+          mkdir -p "$APP_DIR"
+          tar -xzf /tmp/fullstack-deploy.tgz -C "$APP_DIR"
+          find "$APP_DIR/scripts" -name '*.sh' -exec sed -i 's/\r$//' {} \;
+          chmod +x "$APP_DIR"/scripts/cloud/*.sh
+          bash "$APP_DIR/scripts/cloud/deploy.sh"
+          REMOTE

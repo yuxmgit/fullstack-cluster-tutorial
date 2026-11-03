@@ -1,0 +1,21 @@
+[mysqld]
+# ===== 从库（Replica）=====
+
+server-id=2
+
+log_bin=mysql-bin
+binlog_format=ROW
+gtid_mode=ON
+enforce_gtid_consistency=ON
+
+# 中继日志：从主库拉回来的 binlog 先存这里，再由 SQL 线程重放
+relay_log=relay-bin
+
+# 只读：防止业务代码或人肉操作误写到从库
+# （复制线程是特权线程，不受此限制，所以同步照常进行）
+read_only=ON
+super_read_only=ON
+
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+default-authentication-plugin=mysql_native_password

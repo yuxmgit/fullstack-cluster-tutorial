@@ -1,0 +1,237 @@
+# ============================================================
+#  生产编排（腾讯云单机 / 也可直接搬到多机）
+#
+#  与教学版 deploy/docker-compose.yml 的区别：
+#    1. 所有密码来自 deploy/cloud/.env，不再硬编码
+#    2. MySQL / Redis / 后端 一律不映射端口，只在内网互通
+#    3. 只暴露 80 / 443，由 Nginx 统一入口
+#    4. Cookie 强制 Secure，只在 HTTPS 下传输
+#    5. 每个服务限制 CPU/内存，日志自动轮转（防止撑爆磁盘）
+#    6. 关闭调试接口、关闭演示账号
+#
+#  启动方式由 scripts/cloud/deploy.sh 负责（它会先生成 runtime/ 下的配置）。
+#  手动查看配置：
+#    docker compose -f deploy/cloud/docker-compose.prod.yml --env-file deploy/cloud/.env config
+# ============================================================
+
+name: fullstack-prod
+
+# ---------- 日志轮转：容器日志不清会吃光系统盘 ----------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ---------- 3 个后端副本共享 ----------
+x-backend-common: &backend-common
+  build:
+    context: ../../backend
+  image: "${IMAGE_PREFIX:-}fullstack-backend:${TAG:-latest}"
+  restart: always
+  logging: *default-logging
+  environment: &backend-env
+    DB_WRITE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql-master:3306/${MYSQL_DATABASE}?charset=utf8mb4"
+    DB_READ_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql-slave:3306/${MYSQL_DATABASE}?charset=utf8mb4"
+    REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+    SESSION_BACKEND: "redis"
+    SESSION_TTL_SECONDS: "${SESSION_TTL_SECONDS:-1800}"
+    # 上了 HTTPS 才能开这个，否则浏览器不会保存 Cookie
+    COOKIE_SECURE: "true"
+    CORS_ORIGINS: "https://${DOMAIN}"
+    SEED_DEMO_USERS: "${SEED_DEMO_USERS:-false}"
+    ADMIN_INITIAL_PASSWORD: "${ADMIN_INITIAL_PASSWORD:-}"
+    ENABLE_DEBUG_ENDPOINTS: "${ENABLE_DEBUG_ENDPOINTS:-false}"
+    TZ: "${TZ:-Asia/Shanghai}"
+  depends_on:
+    mysql-master:
+      condition: service_healthy
+    mysql-slave:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 640M
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=2)"]
+    interval: 15s
+    timeout: 3s
+    retries: 3
+    start_period: 30s
+
+services:
+  # ---------------------- Redis：集中式 Session ----------------------
+  redis:
+    image: redis:7-alpine
+    restart: always
+    logging: *default-logging
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    environment:
+      # 只给 healthcheck 用；真正的密码在 deploy.sh 生成的 runtime/redis.conf 里
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    volumes:
+      - ./runtime/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 320M
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------- MySQL 主库 ----------------------
+  mysql-master:
+    image: mysql:8.0
+    hostname: mysql-master
+    restart: always
+    logging: *default-logging
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--max-connections=300"
+      - "--slow_query_log=1"
+      - "--long_query_time=1"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: "${MYSQL_DATABASE}"
+      MYSQL_USER: "${MYSQL_USER}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - ../mysql/master.cnf:/etc/mysql/conf.d/master.cnf:ro
+      # 由 deploy.sh 用 envsubst 生成，避免把密码写进仓库
+      - ./runtime/init:/docker-entrypoint-initdb.d:ro
+      - mysql-master-data:/var/lib/mysql
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # ---------------------- MySQL 从库（只读）----------------------
+  mysql-slave:
+    image: mysql:8.0
+    hostname: mysql-slave
+    restart: always
+    logging: *default-logging
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--max-connections=300"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MYSQL_ROOT_HOST: "%"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - ../mysql/slave.cnf:/etc/mysql/conf.d/slave.cnf:ro
+      - mysql-slave-data:/var/lib/mysql
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # ---------------------- 一次性：建立主从复制 ----------------------
+  replica-init:
+    image: mysql:8.0
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+      mysql-slave:
+        condition: service_healthy
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MASTER_HOST: mysql-master
+      SLAVE_HOST: mysql-slave
+      REPL_PASS: "${MYSQL_REPL_PASSWORD}"
+    volumes:
+      - ../mysql/replica-init.sh:/init/replica-init.sh:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["tr -d '\\r' < /init/replica-init.sh > /tmp/r.sh && exec /bin/bash /tmp/r.sh"]
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------- 后端副本 ----------------------
+  backend-1:
+    <<: *backend-common
+    hostname: backend-1
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-1
+
+  backend-2:
+    <<: *backend-common
+    hostname: backend-2
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-2
+
+  backend-3:
+    <<: *backend-common
+    hostname: backend-3
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-3
+
+  # ---------------------- 前端静态资源 ----------------------
+  frontend:
+    build:
+      context: ../../frontend
+    image: "${IMAGE_PREFIX:-}fullstack-frontend:${TAG:-latest}"
+    restart: always
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 128M
+
+  # ---------------------- 唯一入口：HTTPS + 负载均衡 ----------------------
+  lb:
+    image: nginx:1.27-alpine
+    restart: always
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # 官方镜像会把 /etc/nginx/templates/*.template 里的 ${DOMAIN} 替换掉
+      DOMAIN: "${DOMAIN}"
+    volumes:
+      - ./nginx-lb.prod.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./certbot-webroot:/var/www/certbot
+    depends_on:
+      - frontend
+      - backend-1
+      - backend-2
+      - backend-3
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  redis-data:
+  mysql-master-data:
+  mysql-slave-data:

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.db
+*.sqlite3
+
+# Node
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+
+# 生产部署：含明文密码与证书，绝不能提交
+deploy/cloud/.env
+deploy/cloud/.env.*
+!deploy/cloud/.env.production.example
+deploy/cloud/runtime/
+deploy/cloud/certs/
+deploy/cloud/certbot-webroot/
+backups/
+*.tgz
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

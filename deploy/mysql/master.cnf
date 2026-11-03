@@ -1,0 +1,27 @@
+[mysqld]
+# ===== 主库（Source）=====
+
+# 集群内每个实例必须唯一，否则复制会互相打架
+server-id=1
+
+# 开启 binlog：从库就是靠重放它来同步的
+log_bin=mysql-bin
+binlog_format=ROW
+
+# GTID：给每个事务一个全局唯一编号，
+# 从库只需说「我从这个编号之后开始要」，不用人工记 binlog 文件名和位置
+gtid_mode=ON
+enforce_gtid_consistency=ON
+
+# binlog 保留 7 天（按磁盘和恢复需求调整）
+binlog_expire_logs_seconds=604800
+
+# 字符集
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+
+# 兼容性：让账号默认用 mysql_native_password，避免客户端缺少插件时报错
+default-authentication-plugin=mysql_native_password
+
+# 教学环境：关掉 binlog 校验和以简化（生产建议保持默认 ON）
+# 这里保持默认，不做修改
