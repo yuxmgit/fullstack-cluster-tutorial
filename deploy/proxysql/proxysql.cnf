@@ -1,0 +1,102 @@
+# ============================================================
+#  ProxySQL 配置（教学版：一主一从，读写分离）
+#
+#  业务系统只需要连 proxysql:6033 这一个入口：
+#    - 写操作（INSERT/UPDATE/DELETE/DDL）→ 写组 10 → 主库
+#    - SELECT                            → 读组 20 → 从库
+#  主库挂了/加从库，业务代码零改动，改的都是这份配置。
+#
+#  端口：
+#    6033  业务端口（后端连接）
+#    6032  管理端口（查看统计：mysql -h proxysql -P 6032 -u admin -padminpass）
+# ============================================================
+
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+	# 管理接口的账号密码（注意和业务账号 demo 是两回事）
+	admin_credentials="admin:adminpass"
+	port=6032
+}
+
+mysql_variables=
+{
+	threads=4
+	max_connections=2048
+	default_query_delay=0
+	default_query_timeout=36000000
+	interfaces="0.0.0.0:6033"
+	default_schema="information_schema"
+	stacksize=1048576
+	server_version="8.0"
+	connect_timeout_server=3000
+
+	# ---------- 后端健康监控 ----------
+	# monitor 账号用于探测后端存活 / read_only 状态（在 01-init.sql 里创建）
+	monitor_username="monitor"
+	monitor_password="monitor123"
+	monitor_history=600000
+	monitor_connect_interval=60000
+	monitor_ping_interval=10000
+	# 每 1.5 秒查一次后端 read_only 状态，用于主从自动分组
+	monitor_read_only_interval=1500
+	monitor_read_only_timeout=500
+	ping_interval_server_msec=120000
+	ping_timeout_server=500
+	commands_stats=true
+	sessions_sort=true
+	connect_retries_on_failure=10
+}
+
+# ---------- 后端服务器 ----------
+# hostgroup 10 = 写组（主库）
+# hostgroup 20 = 读组（从库）
+mysql_servers =
+(
+	{ address="mysql-master" , port=3306 , hostgroup=10 , max_connections=100 , comment="主库：所有写" },
+	{ address="mysql-slave" , port=3306 , hostgroup=20 , max_connections=100 , comment="从库：所有读" }
+)
+
+# ---------- 谁能连代理 ----------
+# 业务账号：客户端用 demo/demo123 连 6033，
+# 代理再拿同一组凭证连后端 MySQL（所以后端也必须有 demo 用户，复制已保证）。
+# transaction_persistent=1：事务一旦开始就固定在首个 hostgroup，
+# 避免「事务里先写后读，读被分到从库看不到自己的写」。
+mysql_users =
+(
+	{ username="demo" , password="demo123" , default_hostgroup=10 , transaction_persistent=1 , active=1 }
+)
+
+# ---------- 读写分流规则 ----------
+# 规则从上到下匹配，命中即停（apply=1）。
+# default_hostgroup=10 兜底：没命中规则的语句（INSERT/UPDATE/DDL/SET/COMMIT...）全进写组。
+mysql_query_rules =
+(
+	{
+		rule_id=100
+		active=1
+		# SELECT ... FOR UPDATE 是要加锁的读，必须走主库，优先级最高
+		match_pattern="^SELECT.*FOR UPDATE"
+		destination_hostgroup=10
+		apply=1
+	},
+	{
+		rule_id=200
+		active=1
+		# 其余 SELECT 全部走从库
+		match_pattern="^SELECT"
+		destination_hostgroup=20
+		apply=1
+	}
+)
+
+# ---------- 主从自动分组 ----------
+# monitor 每 1.5 秒检查后端 read_only：
+#   read_only=ON  的实例 → 移入 reader_hostgroup(20)
+#   read_only=OFF 的实例 → 移入 writer_hostgroup(10)
+# 好处：主库故障转移后（新主库 read_only=OFF），代理自动跟着切换，业务无感。
+mysql_replication_hostgroups =
+(
+	{ writer_hostgroup=10 , reader_hostgroup=20 , check_type="read_only" , comment="按 read_only 自动识别主从角色" }
+)

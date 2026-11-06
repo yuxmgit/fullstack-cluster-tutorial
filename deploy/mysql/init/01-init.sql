@@ -14,6 +14,12 @@ CREATE DATABASE IF NOT EXISTS fullstack_demo
 CREATE USER IF NOT EXISTS 'demo'@'%' IDENTIFIED WITH mysql_native_password BY 'demo123';
 GRANT ALL PRIVILEGES ON fullstack_demo.* TO 'demo'@'%';
 
+-- ProxySQL 监控账号：代理用它探测后端存活和 read_only 状态
+-- （见 deploy/proxysql/proxysql.cnf 的 monitor_username）。
+-- USAGE = 不授权任何操作，只允许登录；REPLICATION CLIENT 允许查看复制状态。
+CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED WITH mysql_native_password BY 'monitor123';
+GRANT USAGE, REPLICATION CLIENT ON *.* TO 'monitor'@'%';
+
 -- 复制账号由 replica-init 容器创建，这里不重复写，
 -- 便于你对照教程 04 章看「谁负责创建什么」。
 

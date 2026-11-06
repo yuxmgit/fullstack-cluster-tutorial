@@ -7,9 +7,10 @@
 #  拓扑：
 #    lb ──┬─ frontend            静态页面
 #         └─ backend-1/2/3      轮询，三个完全相同的副本
-#                ├─ redis        集中式 Session + 启动锁 + 全局计数
-#                ├─ mysql-master 写
-#                └─ mysql-slave  读（binlog/GTID 自动同步）
+#                ├─ redis         集中式 Session + 启动锁 + 全局计数
+#                ├─ proxysql      数据库代理：写→主库，SELECT→从库（6032 管理口可看统计）
+#                ├─ mysql-master  写（藏在代理后面）
+#                └─ mysql-slave   读（binlog/GTID 自动同步）
 #
 #  实验开关（教程 02 章）：
 #    $env:SESSION_BACKEND = "memory"   → 复现「集群掉登录」
@@ -25,8 +26,12 @@ x-backend-common: &backend-common
   image: fullstack-cluster-backend:latest
   restart: unless-stopped
   environment: &backend-env
-    DB_WRITE_URL: mysql+pymysql://demo:demo123@mysql-master:3306/fullstack_demo
-    DB_READ_URL: mysql+pymysql://demo:demo123@mysql-slave:3306/fullstack_demo
+    # 读写分离已下沉到 ProxySQL 代理：业务只看到一个入口 proxysql:6033。
+    # 两个 URL 相同 → database.py 复用同一个引擎；
+    # 实际的「写→主库、SELECT→从库」分流由代理层的 query_rules 完成。
+    # （对照旧方案：直接分别连 mysql-master 和 mysql-slave）
+    DB_WRITE_URL: mysql+pymysql://demo:demo123@proxysql:6033/fullstack_demo
+    DB_READ_URL: mysql+pymysql://demo:demo123@proxysql:6033/fullstack_demo
     REDIS_URL: redis://:redispass@redis:6379/0
     # 宿主机环境变量可覆盖；不设则默认 redis
     SESSION_BACKEND: ${SESSION_BACKEND:-redis}
@@ -37,6 +42,8 @@ x-backend-common: &backend-common
     mysql-master:
       condition: service_healthy
     mysql-slave:
+      condition: service_healthy
+    proxysql:
       condition: service_healthy
     redis:
       condition: service_healthy
@@ -68,7 +75,20 @@ services:
   mysql-master:
     image: mysql:8.0
     hostname: mysql-master
-    command: ["--default-authentication-plugin=mysql_native_password"]
+    # 注意：不要挂载 master.cnf！Windows 挂载进容器的文件权限是 0777
+    # （world-writable），MySQL 会直接忽略，导致 gtid_mode=ON 不生效、
+    # replica-init 报 ERROR 1777 退出、复制从未建立。
+    # 所以配置改用命令行参数传入（./mysql/master.cnf 保留仅供阅读对照）。
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-expire-logs-seconds=604800
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
       # 关键：官方镜像默认只创建 root@'localhost'，
@@ -79,7 +99,6 @@ services:
       MYSQL_PASSWORD: demo123
       TZ: Asia/Shanghai
     volumes:
-      - ./mysql/master.cnf:/etc/mysql/conf.d/master.cnf:ro
       - ./mysql/init:/docker-entrypoint-initdb.d:ro
       - mysql-master-data:/var/lib/mysql
     ports:
@@ -95,13 +114,25 @@ services:
   mysql-slave:
     image: mysql:8.0
     hostname: mysql-slave
-    command: ["--default-authentication-plugin=mysql_native_password"]
+    # 同主库：Windows 挂载的 slave.cnf 会被忽略，改为命令行参数
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --relay-log=relay-bin
+      # 只读标志不能放在这里：--super-read-only 会挡住 MySQL 首次初始化
+      # （entrypoint 建系统表需要写数据目录），导致容器起不来。
+      # 只读改为 replica-init.sh 里用 SET PERSIST 设置（持久化到数据目录）。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
       MYSQL_ROOT_HOST: "%"
       TZ: Asia/Shanghai
     volumes:
-      - ./mysql/slave.cnf:/etc/mysql/conf.d/slave.cnf:ro
       - mysql-slave-data:/var/lib/mysql
     ports:
       - "3308:3306"
@@ -131,6 +162,31 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command: ["tr -d '\\r' < /init/replica-init.sh > /tmp/replica-init.sh && exec /bin/bash /tmp/replica-init.sh"]
     restart: "no"
+
+  # ---------------------- 数据库代理 ProxySQL ----------------------
+  # 业务系统只连 proxysql:6033 一个入口，读写分流在这里完成。
+  proxysql:
+    image: proxysql/proxysql:2.6.6
+    hostname: proxysql
+    volumes:
+      # Windows 挂载单文件权限是 0777，但 ProxySQL 没有 MySQL 那种
+      # 「world-writable 就拒绝加载」的安全检查，可以直接挂载
+      - ./proxysql/proxysql.cnf:/etc/proxysql.cnf:ro
+    ports:
+      - "6033:6033" # 业务端口（宿主机调试直连用）
+      - "6032:6032" # 管理端口（查看分流统计）
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+      mysql-slave:
+        condition: service_healthy
+    healthcheck:
+      # 镜像里没有 mysql 客户端，用 bash 的 /dev/tcp 直接探端口
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6033' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   # ---------------------- 3 个后端副本 ----------------------
   backend-1:

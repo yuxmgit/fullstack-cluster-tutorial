@@ -57,6 +57,12 @@ CHANGE REPLICATION SOURCE TO
   SOURCE_PASSWORD='${REPL_PASS}',
   SOURCE_AUTO_POSITION=1,
   GET_SOURCE_PUBLIC_KEY=1;
+# 只读：防止业务代码或人肉操作误写到从库。
+# 不能写进启动参数（会阻塞首次初始化），用 SET PERSIST 持久化到数据目录，
+# 重启后依然生效，等效于写在配置文件里。
+# （复制线程是特权线程，不受此限制，所以同步照常进行）
+SET PERSIST read_only=ON;
+SET PERSIST super_read_only=ON;
 START REPLICA;
 SQL
 
